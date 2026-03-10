@@ -24,7 +24,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - run: .github/build.sh ubuntu
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v6
       with:
         name: pam_p11
         path:
