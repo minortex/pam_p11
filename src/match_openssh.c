@@ -2,6 +2,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <pwd.h>
+#include <unistd.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -450,23 +451,66 @@ static EVP_PKEY *ssh_nistp_line_to_key(char *line)
 	return init_evp_pkey_ec(nid, decoded + i, len);
 }
 
-extern int match_user_openssh(EVP_PKEY *authkey, const char *login)
+/*
+ * Check that the opened file is owned by the given user and is not
+ * world-writable.  Returns 1 if safe, 0 otherwise.
+ */
+static int check_file_owner(int fd, const struct passwd *pw)
+{
+	struct stat st;
+
+	if (0 != fstat(fd, &st))
+		return 0;
+	/* Must be a regular file (not a symlink, FIFO, etc.) */
+	if (!S_ISREG(st.st_mode))
+		return 0;
+	/* Must be owned by the target user or by root */
+	if (st.st_uid != pw->pw_uid && st.st_uid != 0)
+		return 0;
+	/* Must not be group-writable or world-writable */
+	if (st.st_mode & (S_IWGRP | S_IWOTH))
+		return 0;
+	return 1;
+}
+
+extern int match_user_openssh(EVP_PKEY *authkey, const char *login,
+		const char *file_path)
 {
 	char filename[PATH_MAX];
 	char line[OPENSSH_LINE_MAX];
 	struct passwd *pw;
 	int found;
+	int fd;
 	FILE *file;
 
 	pw = getpwnam(login);
 	if (!pw || !pw->pw_dir)
 		return -1;
 
-	snprintf(filename, PATH_MAX, "%s/.ssh/authorized_keys", pw->pw_dir);
+	if (file_path && file_path[0]) {
+		snprintf(filename, sizeof filename, "%s", file_path);
+	} else {
+		snprintf(filename, sizeof filename, "%s/.ssh/authorized_keys",
+				pw->pw_dir);
+	}
 
-	file = fopen(filename, "r");
-	if (!file)
+	/* Use open+O_NOFOLLOW+fstat+fdopen to avoid TOCTOU:
+	 * we stat the fd we actually opened, then check ownership
+	 * before reading any data. */
+	fd = open(filename, O_RDONLY | O_NOFOLLOW);
+	if (fd < 0)
 		return -1;
+
+	if (!check_file_owner(fd, pw)) {
+		close(fd);
+		return -1;
+	}
+
+	file = fdopen(fd, "r");
+	if (!file) {
+		close(fd);
+		return -1;
+	}
 
 	found = 0;
 	do {

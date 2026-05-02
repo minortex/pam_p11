@@ -226,11 +226,176 @@ err:
 	return r;
 }
 
+/*
+ * Check that a username is safe for use in path construction.
+ * Rejects usernames containing directory traversal sequences or unsafe
+ * characters that could be abused to escape the intended directory.
+ */
+static int is_safe_username(const char *user)
+{
+	const char *p;
+
+	if (!user || !user[0])
+		return 0;
+
+	for (p = user; *p; p++) {
+		if (!isalnum((unsigned char)*p) && *p != '_'
+				&& *p != '-' && *p != '.')
+			return 0;
+	}
+	if (strstr(user, "..") || strstr(user, "/") || strstr(user, "\\"))
+		return 0;
+
+	return 1;
+}
+
+/*
+ * Substitute "%u" in a path with the username.
+ * Returns a malloc'd string, or NULL. Caller must free().
+ * Only call this after verifying the username with is_safe_username().
+ */
+static char *path_subst_user(const char *path, const char *user)
+{
+	const char *p;
+	size_t len, ulen;
+	char *result, *r;
+
+	if (!path || !path[0] || !user)
+		return NULL;
+
+	/* count "%u" occurrences and compute new length */
+	ulen = strlen(user);
+	len = 0;
+	for (p = path; *p; p++) {
+		if (p[0] == '%' && p[1] == 'u') {
+			len += ulen;
+			p++;
+		} else {
+			len++;
+		}
+	}
+
+	result = malloc(len + 1);
+	if (!result)
+		return NULL;
+
+	for (p = path, r = result; *p; p++) {
+		if (p[0] == '%' && p[1] == 'u') {
+			memcpy(r, user, ulen);
+			r += ulen;
+			p++;
+		} else {
+			*r++ = *p;
+		}
+	}
+	*r = '\0';
+
+	return result;
+}
+
+/*
+ * Allowed base directories for authorized_keys / authorized_certificates
+ * files.  The resolved path must live under one of these prefixes.
+ * This list is checked at runtime — paths outside these trees are rejected.
+ */
+static const char *trusted_base_dirs[] = {
+	"/home/",
+	"/etc/",
+	NULL,
+};
+
+/*
+ * Check whether resolved_path starts with one of the trusted base
+ * directory prefixes.  Returns 1 if trusted, 0 otherwise.
+ */
+static int path_in_trusted_base(const char *resolved_path)
+{
+	const char **base;
+	for (base = trusted_base_dirs; *base; base++) {
+		size_t len = strlen(*base);
+		if (strncmp(resolved_path, *base, len) == 0
+				&& resolved_path[len] != '\0')
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Validate a path constructed from a (possibly user-substituted) template.
+ *
+ * 1. The path must be absolute.
+ * 2. The directory component is resolved with realpath(3) to defeat symlink
+ *    tricks.  (The file itself may not yet exist; only the directory must.)
+ * 3. The resulting canonical path must live under one of the trusted base
+ *    directories.
+ *
+ * Returns the resolved canonical path (malloc'd), or NULL on failure.
+ */
+static char *validate_path(const char *path)
+{
+	char *dir, *dir_resolved;
+	char *result;
+	const char *basename_part;
+	size_t dir_len, base_len;
+
+	if (!path || !path[0])
+		return NULL;
+
+	/* Must be absolute */
+	if (path[0] != '/')
+		return NULL;
+
+	/* Find the directory and base components */
+	basename_part = strrchr(path, '/');
+	if (!basename_part || basename_part == path)
+		return NULL;
+	dir_len = (size_t)(basename_part - path);
+	base_len = strlen(basename_part + 1);
+	if (base_len == 0)
+		return NULL;
+
+	/* Base filename must not contain slashes or NUL bytes */
+	if (strchr(basename_part + 1, '/'))
+		return NULL;
+
+	/* Resolve the directory (the only part that must exist right now).
+	 * realpath() naturally normalizes "."/".." and symlinks — we don't
+	 * need a separate strstr("..") check here. */
+	dir = malloc(dir_len + 1);
+	if (!dir)
+		return NULL;
+	memcpy(dir, path, dir_len);
+	dir[dir_len] = '\0';
+	dir_resolved = realpath(dir, NULL);
+	free(dir);
+	if (!dir_resolved)
+		return NULL;
+
+	/* Recompose: resolved_dir + "/" + base */
+	result = malloc(strlen(dir_resolved) + 1 + base_len + 1);
+	if (!result) {
+		free(dir_resolved);
+		return NULL;
+	}
+	sprintf(result, "%s/%s", dir_resolved, basename_part + 1);
+	free(dir_resolved);
+
+	/* Enforce that the final path stays inside a trusted tree */
+	if (!path_in_trusted_base(result)) {
+		free(result);
+		return NULL;
+	}
+
+	return result;
+}
+
 static int module_refresh(pam_handle_t *pamh,
 		int flags, int argc, const char **argv,
 		const char **user, PKCS11_CTX **ctx,
 		PKCS11_SLOT **slots, unsigned int *nslots,
-		const char **pin_regex)
+		const char **pin_regex,
+		const char **openssh_keys_path,
+		const char **opensc_certs_path)
 {
 	int r;
 	struct module_data *module_data;
@@ -279,6 +444,77 @@ static int module_refresh(pam_handle_t *pamh,
 		goto err;
 	}
 
+	/* argv[2]: custom authorized_keys path, with %u -> user substitution */
+	if (2 < argc && argv[2] && argv[2][0]) {
+		char *substituted;
+		if (strstr(argv[2], "%u")) {
+			if (!is_safe_username(*user)) {
+				pam_syslog(pamh, LOG_ALERT,
+						"Unsafe username rejected: %s", *user);
+				prompt(flags, pamh, PAM_ERROR_MSG, NULL,
+						_("Unsafe username characters"));
+				r = PAM_USER_UNKNOWN;
+				goto err;
+			}
+			substituted = path_subst_user(argv[2], *user);
+		} else {
+			substituted = strdup(argv[2]);
+		}
+		if (NULL == substituted) {
+			pam_syslog(pamh, LOG_CRIT, "malloc() failed");
+			r = PAM_BUF_ERR;
+			goto err;
+		}
+		/* canonicalize to protect against symlinks and path traversal */
+		*openssh_keys_path = validate_path(substituted);
+		free(substituted);
+		if (NULL == *openssh_keys_path) {
+			pam_syslog(pamh, LOG_ALERT,
+					"Invalid or unsafe keys path");
+			r = PAM_AUTHINFO_UNAVAIL;
+			goto err;
+		}
+	} else {
+		*openssh_keys_path = NULL;
+	}
+
+	/* argv[3]: custom authorized_certificates path */
+	if (3 < argc && argv[3] && argv[3][0]) {
+		char *substituted;
+		if (strstr(argv[3], "%u")) {
+			if (!is_safe_username(*user)) {
+				pam_syslog(pamh, LOG_ALERT,
+						"Unsafe username rejected: %s", *user);
+				prompt(flags, pamh, PAM_ERROR_MSG, NULL,
+						_("Unsafe username characters"));
+				r = PAM_USER_UNKNOWN;
+				goto err;
+			}
+			substituted = path_subst_user(argv[3], *user);
+		} else {
+			substituted = strdup(argv[3]);
+		}
+		if (NULL == substituted) {
+			pam_syslog(pamh, LOG_CRIT, "malloc() failed");
+			free((void *)*openssh_keys_path);
+			*openssh_keys_path = NULL;
+			r = PAM_BUF_ERR;
+			goto err;
+		}
+		*opensc_certs_path = validate_path(substituted);
+		free(substituted);
+		if (NULL == *opensc_certs_path) {
+			pam_syslog(pamh, LOG_ALERT,
+					"Invalid or unsafe certs path");
+			free((void *)*openssh_keys_path);
+			*openssh_keys_path = NULL;
+			r = PAM_AUTHINFO_UNAVAIL;
+			goto err;
+		}
+	} else {
+		*opensc_certs_path = NULL;
+	}
+
 	*ctx = module_data->ctx;
 	*nslots = module_data->nslots;
 	*slots = module_data->slots;
@@ -287,8 +523,10 @@ err:
 	return r;
 }
 
-extern int match_user_opensc(EVP_PKEY *authkey, const char *login);
-extern int match_user_openssh(EVP_PKEY *authkey, const char *login);
+extern int match_user_opensc(EVP_PKEY *authkey, const char *login,
+		const char *file_path);
+extern int match_user_openssh(EVP_PKEY *authkey, const char *login,
+		const char *file_path);
 
 static int key_login(pam_handle_t *pamh, int flags, PKCS11_SLOT *slot, const char *pin_regex)
 {
@@ -497,7 +735,8 @@ err:
 static int key_find(pam_handle_t *pamh, int flags, const char *user,
 		PKCS11_CTX *ctx, PKCS11_SLOT *slots, unsigned int nslots,
 		PKCS11_SLOT **authslot, PKCS11_KEY **authkey,
-		EVP_PKEY **authpubkey, PKCS11_CERT **authcert)
+		EVP_PKEY **authpubkey, PKCS11_CERT **authcert,
+		const char *openssh_keys_path, const char *opensc_certs_path)
 {
 	int token_found = 0;
 
@@ -546,9 +785,11 @@ static int key_find(pam_handle_t *pamh, int flags, const char *user,
 		if (0 == PKCS11_enumerate_public_keys(slot->token, &keys, &count)) {
 			while (0 < count && NULL != keys) {
 				EVP_PKEY *pubkey = PKCS11_get_public_key(keys);
-				int r = match_user_opensc(pubkey, user);
+				int r = match_user_opensc(pubkey, user,
+						opensc_certs_path);
 				if (1 != r) {
-					r = match_user_openssh(pubkey, user);
+					r = match_user_openssh(pubkey, user,
+							openssh_keys_path);
 				}
 				if (1 == r) {
 					*authpubkey = pubkey;
@@ -570,9 +811,11 @@ static int key_find(pam_handle_t *pamh, int flags, const char *user,
 		if (0 == PKCS11_enumerate_certs(slot->token, &certs, &count)) {
 			while (0 < count && NULL != certs) {
 				EVP_PKEY *pubkey = X509_get_pubkey(certs->x509);
-				int r = match_user_opensc(pubkey, user);
+				int r = match_user_opensc(pubkey, user,
+						opensc_certs_path);
 				if (1 != r) {
-					r = match_user_openssh(pubkey, user);
+					r = match_user_openssh(pubkey, user,
+							openssh_keys_path);
 				}
 				if (1 == r) {
 					*authpubkey = pubkey;
@@ -686,15 +929,19 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t * pamh, int flags, int argc,
 	PKCS11_SLOT *slots, *authslot;
 	const char *user;
 	const char *pin_regex;
+	const char *openssh_keys_path = NULL;
+	const char *opensc_certs_path = NULL;
 
 	r = module_refresh(pamh, flags, argc, argv,
-			&user, &ctx, &slots, &nslots, &pin_regex);
+			&user, &ctx, &slots, &nslots, &pin_regex,
+			&openssh_keys_path, &opensc_certs_path);
 	if (PAM_SUCCESS != r) {
 		goto err;
 	}
 
 	if (1 != key_find(pamh, flags, user, ctx, slots, nslots,
-				&authslot, &authkey, &authpubkey, &authcert)) {
+				&authslot, &authkey, &authpubkey, &authcert,
+				openssh_keys_path, opensc_certs_path)) {
 		r = PAM_AUTHINFO_UNAVAIL;
 		goto err;
 	}
@@ -725,6 +972,8 @@ err:
 #ifdef TEST
 	module_data_cleanup(pamh, global_module_data, r);
 #endif
+	free((void *)openssh_keys_path);
+	free((void *)opensc_certs_path);
 	return r;
 }
 
@@ -771,9 +1020,12 @@ PAM_EXTERN int pam_sm_chauthtok(pam_handle_t * pamh, int flags, int argc,
 	EVP_PKEY *authpubkey = NULL;
 	PKCS11_SLOT *slots, *authslot;
 	const char *user, *pin_regex;
+	const char *openssh_keys_path = NULL;
+	const char *opensc_certs_path = NULL;
 
 	r = module_refresh(pamh, flags, argc, argv,
-			&user, &ctx, &slots, &nslots, &pin_regex);
+			&user, &ctx, &slots, &nslots, &pin_regex,
+			&openssh_keys_path, &opensc_certs_path);
 	if (PAM_SUCCESS != r) {
 		goto err;
 	}
@@ -786,7 +1038,8 @@ PAM_EXTERN int pam_sm_chauthtok(pam_handle_t * pamh, int flags, int argc,
 	}
 
 	if (1 != key_find(pamh, flags, user, ctx, slots, nslots,
-				&authslot, &authkey, &authpubkey, &authcert)) {
+				&authslot, &authkey, &authpubkey, &authcert,
+				openssh_keys_path, opensc_certs_path)) {
 		r = PAM_AUTHINFO_UNAVAIL;
 		goto err;
 	}
@@ -811,6 +1064,8 @@ PAM_EXTERN int pam_sm_chauthtok(pam_handle_t * pamh, int flags, int argc,
 
 err:
 	EVP_PKEY_free(authpubkey);
+	free((void *)openssh_keys_path);
+	free((void *)opensc_certs_path);
 #ifdef TEST
 	module_data_cleanup(pamh, global_module_data, r);
 #endif
